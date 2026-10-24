@@ -1,0 +1,361 @@
+
+name: Slendytubbies III Demo - iOS Build Attempt
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover-original:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download original demo APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p input report
+          gh release download \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.apk' \
+            --dir input --clobber
+
+          COUNT="$(find input -maxdepth 1 -name '*.apk' | wc -l | tr -d ' ')"
+          if [ "$COUNT" -ne 1 ]; then
+            echo 'Need exactly one original Demo APK'
+            exit 1
+          fi
+
+          echo "APK_PATH=$(find input -name '*.apk' | head -1)" >> "$GITHUB_ENV"
+
+      - name: Extract original Unity assets and game code
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, zipfile
+
+          apk = Path(os.environ['APK_PATH'])
+          root = Path('work/Game_Data')
+          root.mkdir(parents=True, exist_ok=True)
+
+          with zipfile.ZipFile(apk) as z:
+              names = set(z.namelist())
+              dll = 'assets/bin/Data/Managed/Assembly-CSharp.dll'
+              if dll not in names:
+                  raise SystemExit('Original C# game DLL missing')
+
+              levels = [
+                  n for n in names
+                  if n.startswith('assets/bin/Data/level')
+              ]
+              if not levels:
+                  raise SystemExit('Original scenes missing')
+
+              for name in names:
+                  prefix = 'assets/bin/Data/'
+                  if not name.startswith(prefix) or name.endswith('/'):
+                      continue
+                  rel = name[len(prefix):]
+                  if '..' in Path(rel).parts or rel.startswith('/'):
+                      raise SystemExit('Unsafe file path')
+                  dst = root / rel
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  dst.write_bytes(z.read(name))
+
+          Path('report/apk-summary.txt').write_text(
+              f'APK: {apk.name}\n'
+              f'Original scenes: {len(levels)}\n'
+              'Assembly-CSharp.dll: found\n'
+          )
+          print('Original files extracted')
+          PY
+
+      - name: Extract original game icon
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet \
+            'androguard==4.1.3' 'Pillow>=10,<12'
+
+          python3 - <<'PY'
+          import os, zipfile, io
+          from pathlib import Path
+          from androguard.core.apk import APK
+          from PIL import Image
+
+          apk = os.environ['APK_PATH']
+          app = APK(apk)
+          candidates = []
+
+          with zipfile.ZipFile(apk) as z:
+              for dpi in (65536,640,480,320,240,160):
+                  name = app.get_app_icon(max_dpi=dpi)
+                  if not name or name not in z.namelist():
+                      continue
+                  try:
+                      img = Image.open(io.BytesIO(z.read(name)))
+                      img.load()
+                      candidates.append((img.width*img.height,img.copy()))
+                  except Exception:
+                      pass
+
+          if not candidates:
+              raise SystemExit('Original icon not found')
+
+          _, img = max(candidates, key=lambda x:x[0])
+          img.convert('RGBA').resize(
+              (1024,1024),Image.Resampling.LANCZOS
+          ).save('report/original-icon.png')
+
+          print('Original icon extracted')
+          PY
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build AssetRipper CLI
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          git clone --depth 1 --recurse-submodules \
+            https://github.com/nowl-it/AssetRipperCLI.git \
+            tools/AssetRipperCLI
+
+          PROJ="$(find tools/AssetRipperCLI \
+            -name 'AssetRipper.GUI.csproj' | head -1)"
+
+          test -n "$PROJ"
+          dotnet publish "$PROJ" \
+            -c Release \
+            -o "$GITHUB_WORKSPACE/tools/ripper" \
+            > report/ripper-build.log 2>&1 || {
+              tail -n 80 report/ripper-build.log
+              exit 1
+            }
+
+      - name: Recover original Unity project
+        run: |
+          set -euo pipefail
+
+          RUNNER="$(find tools/ripper \
+            -maxdepth 1 \
+            -name 'AssetRipper.GUI*.dll' | head -1)"
+
+          test -n "$RUNNER"
+
+          dotnet "$RUNNER" \
+            --cli \
+            --input "$GITHUB_WORKSPACE/work/Game_Data" \
+            --output "$GITHUB_WORKSPACE/export" \
+            --mode Unity \
+            --script-content-level Level0 \
+            > report/ripper-export.log 2>&1 || {
+              tail -n 80 report/ripper-export.log
+              exit 1
+            }
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          matches = [
+              p for p in Path('export').rglob('Assets')
+              if p.is_dir()
+              and (p.parent/'ProjectSettings').is_dir()
+          ]
+
+          if len(matches) != 1:
+              raise SystemExit('Unity project recovery failed')
+
+          shutil.copytree(
+              matches[0].parent,
+              'RecoveredProject',
+              dirs_exist_ok=True
+          )
+          print('Original Unity project recovered')
+          PY
+
+      - name: Prepare original icon and iOS build
+        run: |
+          set -euo pipefail
+          mkdir -p RecoveredProject/Assets/Editor
+          mkdir -p RecoveredProject/ProjectSettings
+
+          cp report/original-icon.png \
+            RecoveredProject/Assets/Original-Demo-Icon.png
+
+          printf 'm_EditorVersion: 2022.3.62f1\n' \
+            > RecoveredProject/ProjectSettings/ProjectVersion.txt
+
+          cat > RecoveredProject/Assets/Editor/BuildOriginalDemoIOS.cs <<'CS'
+          using System;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEngine;
+          using UnityEditor.Build.Reporting;
+
+          public static class BuildOriginalDemoIOS {
+              public static void Build() {
+                  var scenes = AssetDatabase.FindAssets("t:Scene")
+                      .Select(AssetDatabase.GUIDToAssetPath)
+                      .Where(p => p.EndsWith(".unity"))
+                      .OrderBy(p => p)
+                      .ToArray();
+
+                  if (scenes.Length == 0)
+                      throw new Exception("Original scenes missing");
+
+                  var icon = AssetDatabase.LoadAssetAtPath<Texture2D>(
+                      "Assets/Original-Demo-Icon.png"
+                  );
+
+                  if (icon == null)
+                      throw new Exception("Original icon missing");
+
+                  PlayerSettings.SetIconsForTargetGroup(
+                      BuildTargetGroup.iPhone,
+                      new Texture2D[]{icon}
+                  );
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS,
+                      "com.slendytubbies.demo.unofficial"
+                  );
+
+                  PlayerSettings.defaultInterfaceOrientation =
+                      UIOrientation.LandscapeLeft;
+
+                  PlayerSettings.iOS.targetOSVersionString = "13.0";
+
+                  var options = new BuildPlayerOptions {
+                      scenes = scenes,
+                      locationPathName = "build/iOS",
+                      target = BuildTarget.iOS,
+                      options = BuildOptions.None
+                  };
+
+                  var result = BuildPipeline.BuildPlayer(options);
+
+                  if (result.summary.result != BuildResult.Succeeded)
+                      throw new Exception("Unity iOS export failed");
+              }
+          }
+          CS
+
+      - name: Save recovered project
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Slendytubbies-Demo-RecoveredProject
+          path: |
+            RecoveredProject/
+            report/
+          retention-days: 7
+          if-no-files-found: warn
+
+  unity-ios-export:
+    needs: recover-original
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore original project
+        uses: actions/download-artifact@v4
+        with:
+          name: Slendytubbies-Demo-RecoveredProject
+
+      - name: Check Unity license
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        run: |
+          if [ -z "$UNITY_LICENSE" ] && [ -z "$UNITY_SERIAL" ]; then
+            echo 'Unity activation is required'
+            exit 1
+          fi
+
+      - name: Export Unity game to Xcode
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          projectPath: RecoveredProject
+          targetPlatform: iOS
+          buildMethod: BuildOriginalDemoIOS.Build
+
+      - name: Upload Xcode project
+        uses: actions/upload-artifact@v4
+        with:
+          name: Slendytubbies-Demo-Xcode
+          path: RecoveredProject/build/iOS/
+          retention-days: 7
+          if-no-files-found: error
+
+  unsigned-ipa:
+    needs: unity-ios-export
+    runs-on: macos-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Download Xcode project
+        uses: actions/download-artifact@v4
+        with:
+          name: Slendytubbies-Demo-Xcode
+          path: xcode
+
+      - name: Compile for iPhone
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f xcode/Unity-iPhone.xcodeproj/project.pbxproj
+
+          xcodebuild \
+            -project xcode/Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build | tee xcode-build.log
+
+          APP="$(find DerivedData/Build/Products/Release-iphoneos \
+            -maxdepth 1 -name '*.app' -type d | head -1)"
+
+          test -n "$APP"
+          test -f "$APP/Info.plist"
+
+          BIN="$(/usr/libexec/PlistBuddy \
+            -c 'Print CFBundleExecutable' "$APP/Info.plist")"
+
+          test -f "$APP/$BIN"
+          file "$APP/$BIN" | grep -q 'Mach-O'
+
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+
+          zip -qr Slendytubbies-III-Demo-UNSIGNED.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Slendytubbies-III-Demo-IPA
+          path: |
+            Slendytubbies-III-Demo-UNSIGNED.ipa
+            xcode-build.log
+          retention-days: 7
+          if-no-files-found: error
